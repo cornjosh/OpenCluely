@@ -157,9 +157,22 @@ The setup script automatically handles configuration. You only need:
 # Required: Google Gemini API Key (setup script will ask for this)
 GEMINI_API_KEY=your_gemini_api_key_here
 
+# Optional: OpenAI-compatible backend selection
+OPENAI_API_KEY=your_openai_api_key
+LLM_PROVIDER=gemini # gemini | openai
+
 # Optional: Azure Speech Recognition (add later if you want voice features)
 AZURE_SPEECH_KEY=your_azure_speech_key
 AZURE_SPEECH_REGION=your_region
+SPEECH_PROVIDER=azure # azure | volcengine
+
+# Optional: Volcengine speech credentials (required when SPEECH_PROVIDER=volcengine)
+VOLCENGINE_ACCESS_KEY=your_access_key
+VOLCENGINE_SECRET_KEY=your_secret_key
+VOLCENGINE_APP_ID=your_app_id
+
+# Optional: hold-to-switch recording role shortcut
+SPEECH_ROLE_SHORTCUT=CommandOrControl+B
 ```
 
 **Note**: Speech recognition is completely optional. If Azure credentials are not provided, the microphone button will be automatically hidden from all interfaces.
@@ -235,6 +248,7 @@ Voice recognition is completely optional. The setup script will create a `.env` 
 |--------|----------|-------------|
 | **Screenshot Capture** | `⌘⇧S` | Capture screen and analyze via Gemini (image understanding) |
 | **Toggle Speech** | `Alt+R` | Start/stop voice recognition (if configured) |
+| **Hold Interviewee Role** | `⌘/Ctrl+B (hold)` | While held, live transcription is tagged as `interviewee`; release returns to `interviewer` |
 | **Toggle Visibility** | `⌘⇧V` | Show/hide all windows |
 | **Toggle Interaction** | `⌘⇧I` or `Alt+A` | Enable/disable window interaction |
 | **Switch to Chat** | `⌘⇧C` | Open interactive chat window |

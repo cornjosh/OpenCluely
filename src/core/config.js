@@ -39,6 +39,7 @@ class ConfigManager {
       },
 
       llm: {
+        provider: process.env.LLM_PROVIDER || 'gemini',
         gemini: {
           model: 'gemini-2.5-flash',
           maxRetries: 3,
@@ -51,16 +52,42 @@ class ConfigManager {
             topP: 0.9,
             maxOutputTokens: 4096
           }
+        },
+        openai: {
+          model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
+          baseUrl: process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1',
+          timeout: 60000,
+          generation: {
+            temperature: 0.7,
+            max_tokens: 4096
+          }
         }
       },
 
       speech: {
+        provider: process.env.SPEECH_PROVIDER || 'azure',
         azure: {
           language: 'en-US',
           enableDictation: true,
           enableAudioLogging: false,
           outputFormat: 'detailed'
+        },
+        volcengine: {
+          endpoint: process.env.VOLCENGINE_SPEECH_ENDPOINT || 'https://openspeech.bytedance.com/api/v1/vc/ata/submit',
+          appId: process.env.VOLCENGINE_APP_ID || '',
+          language: process.env.VOLCENGINE_SPEECH_LANGUAGE || 'en-US'
+        },
+        roleSwitch: {
+          defaultRole: 'interviewer',
+          alternateRole: 'interviewee',
+          shortcut: process.env.SPEECH_ROLE_SHORTCUT || 'CommandOrControl+B',
+          persistPath: path.join(this.appDataDir, 'speech', 'role-segments.json')
         }
+      },
+
+      logging: {
+        level: process.env.LOG_LEVEL || 'info',
+        path: path.join(this.appDataDir, 'logs')
       },
 
       session: {

@@ -2,6 +2,7 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 const logger = require('../core/logger').createServiceLogger('LLM');
 const config = require('../core/config');
 const { promptLoader } = require('../../prompt-loader');
+const { OpenAICompatibleChatClient } = require('./adapters/openai-compatible-chat.client');
 
 class LLMService {
   constructor() {
@@ -10,6 +11,18 @@ class LLMService {
     this.isInitialized = false;
     this.requestCount = 0;
     this.errorCount = 0;
+    this.chatClient = new OpenAICompatibleChatClient({
+      provider: config.get('llm.provider') || 'gemini',
+      gemini: {
+        apiKey: config.getApiKey('GEMINI'),
+        model: config.get('llm.gemini.model')
+      },
+      openai: {
+        apiKey: process.env.OPENAI_API_KEY,
+        baseUrl: config.get('llm.openai.baseUrl'),
+        model: config.get('llm.openai.model')
+      }
+    });
     
     this.initializeClient();
   }
@@ -59,6 +72,40 @@ class LLMService {
     return Object.fromEntries(
       Object.entries(merged).filter(([, value]) => value !== undefined && value !== null)
     );
+  }
+
+  buildOpenAIChatMessages(text, activeSkill, sessionMemory = [], programmingLanguage = null) {
+    const systemPrompt = this.buildSystemPrompt(activeSkill, programmingLanguage);
+    const historyMessages = Array.isArray(sessionMemory)
+      ? sessionMemory.map((entry) => ({
+          role: entry.role === 'assistant' ? 'assistant' : 'user',
+          content: entry.content || ''
+        }))
+      : [];
+
+    return [
+      { role: 'system', content: systemPrompt },
+      ...historyMessages,
+      { role: 'user', content: this.formatUserMessage(text, activeSkill) }
+    ];
+  }
+
+  async createChatCompletion({ text, activeSkill, sessionMemory = [], programmingLanguage = null, stream = false }) {
+    const openAIRequest = {
+      model: this.chatClient.getProvider() === 'gemini'
+        ? config.get('llm.gemini.model')
+        : config.get('llm.openai.model'),
+      temperature: config.get('llm.gemini.generation.temperature') || config.get('llm.openai.generation.temperature') || 0.7,
+      max_tokens: config.get('llm.openai.generation.max_tokens') || config.get('llm.gemini.generation.maxOutputTokens') || 4096,
+      messages: this.buildOpenAIChatMessages(text, activeSkill, sessionMemory, programmingLanguage),
+      stream
+    };
+
+    if (stream) {
+      return this.chatClient.createChatCompletionStream(openAIRequest);
+    }
+
+    return this.chatClient.createChatCompletion(openAIRequest);
   }
 
   applyGenerationDefaults(request, overrides = {}) {
