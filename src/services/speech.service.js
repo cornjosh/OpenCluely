@@ -370,6 +370,8 @@ const recorder = require('node-record-lpcm16');
 const { EventEmitter } = require('events');
 const logger = require('../core/logger').createServiceLogger('SPEECH');
 const config = require('../core/config');
+const { RecordingRoleController } = require('./recording-role.controller');
+const { AzureCompatibleSpeechAdapter } = require('./adapters/speech-recognition.adapter');
 
 class SpeechService extends EventEmitter {
   constructor() {
@@ -384,12 +386,81 @@ class SpeechService extends EventEmitter {
     this.pushStream = null;
     this.recording = null;
     this.available = false; // track availability
+    this.speechProvider = config.get('speech.provider') || 'azure';
+    this.currentRole = config.get('speech.roleSwitch.defaultRole') || 'interviewer';
+    this.roleController = new RecordingRoleController(config.get('speech.roleSwitch') || {});
+    this.speechAdapter = new AzureCompatibleSpeechAdapter({
+      backend: this.speechProvider,
+      azure: {
+        key: process.env.AZURE_SPEECH_KEY,
+        region: process.env.AZURE_SPEECH_REGION
+      },
+      volcengine: {
+        accessKey: process.env.VOLCENGINE_ACCESS_KEY,
+        secretKey: process.env.VOLCENGINE_SECRET_KEY,
+        appId: process.env.VOLCENGINE_APP_ID,
+        endpoint: config.get('speech.volcengine.endpoint')
+      }
+    });
+
+    const speechConfigPath = process.env.OPENCLUELY_SPEECH_CONFIG_PATH;
+    if (speechConfigPath) {
+      try {
+        const fileConfig = AzureCompatibleSpeechAdapter.loadBackendConfig(speechConfigPath);
+        const configuredBackend = fileConfig?.speech?.provider || fileConfig?.provider;
+        if (configuredBackend) {
+          this.speechProvider = configuredBackend;
+          this.speechAdapter.setBackend(configuredBackend);
+          logger.info('Speech backend loaded from config file', {
+            action: 'speech_backend_switch',
+            role: this.currentRole,
+            backend: configuredBackend,
+            speechConfigPath
+          });
+        }
+      } catch (error) {
+        logger.warn('Failed to load speech backend config file', {
+          action: 'speech_backend_config_load',
+          role: this.currentRole,
+          speechConfigPath,
+          error: error.message
+        });
+      }
+    }
+
+    this.roleController.on('role-changed', (payload) => {
+      this.currentRole = payload.role;
+      this.emit('recording-role-changed', payload);
+    });
+
+    process.on('exit', () => {
+      try {
+        this.roleController.persistSegments();
+      } catch (error) {
+        logger.error('Failed to persist speech role segments on process exit', {
+          action: 'role_persist',
+          role: this.currentRole,
+          error: error.message
+        });
+      }
+    });
     
     this.initializeClient();
   }
 
   initializeClient() {
     try {
+      if (this.speechProvider !== 'azure') {
+        this.available = true;
+        this.emit('status', `Speech adapter ready (${this.speechProvider})`);
+        logger.info('Speech service initialized with adapter backend', {
+          action: 'speech_backend_switch',
+          role: this.currentRole,
+          backend: this.speechProvider
+        });
+        return;
+      }
+
       // Get Azure Speech credentials from environment variables
       const subscriptionKey = process.env.AZURE_SPEECH_KEY;
       const region = process.env.AZURE_SPEECH_REGION;
@@ -447,6 +518,13 @@ class SpeechService extends EventEmitter {
 
   startRecording() {
     try {
+      if (this.speechProvider !== 'azure') {
+        const errorMsg = `Live microphone recording currently supports azure backend only (current: ${this.speechProvider})`;
+        logger.warn(errorMsg, { action: 'recording_start_unsupported', role: this.currentRole });
+        this.emit('error', errorMsg);
+        return;
+      }
+
       if (!this.speechConfig) {
         const errorMsg = 'Azure Speech client not initialized';
         logger.error(errorMsg);
@@ -522,16 +600,21 @@ class SpeechService extends EventEmitter {
              const sessionDuration = Date.now() - this.sessionStartTime;
              
              // Only emit transcription if there's actual text content
-             if (e.result.text && e.result.text.trim().length > 0) {
-               logger.info('Final transcription received', {
-                 text: e.result.text,
-                 sessionDuration: `${sessionDuration}ms`,
-                 textLength: e.result.text.length,
-                 confidence: e.result.properties?.getProperty(sdk.PropertyId.SpeechServiceResponse_JsonResult)
-               });
-               
-               this.emit('transcription', e.result.text);
-             } else {
+              if (e.result.text && e.result.text.trim().length > 0) {
+                logger.info('Final transcription received', {
+                  text: e.result.text,
+                  role: this.currentRole,
+                  sessionDuration: `${sessionDuration}ms`,
+                  textLength: e.result.text.length,
+                  confidence: e.result.properties?.getProperty(sdk.PropertyId.SpeechServiceResponse_JsonResult)
+                });
+                
+                this.emit('transcription', e.result.text);
+                this.emit('transcription-with-role', {
+                  text: e.result.text,
+                  role: this.currentRole
+                });
+              } else {
                logger.debug('Empty transcription result ignored', {
                  sessionDuration: `${sessionDuration}ms`,
                  confidence: e.result.properties?.getProperty(sdk.PropertyId.SpeechServiceResponse_JsonResult)
@@ -757,10 +840,6 @@ class SpeechService extends EventEmitter {
   }
 
   async recognizeFromFile(audioFilePath) {
-    if (!this.speechConfig) {
-      throw new Error('Speech service not initialized');
-    }
-
     const startTime = Date.now();
     
     try {
@@ -769,44 +848,24 @@ class SpeechService extends EventEmitter {
       if (!fs.existsSync(audioFilePath)) {
         throw new Error(`Audio file not found: ${audioFilePath}`);
       }
-
-      const audioConfig = sdk.AudioConfig.fromWavFileInput(audioFilePath);
-      const recognizer = new sdk.SpeechRecognizer(this.speechConfig, audioConfig);
-
-      const result = await new Promise((resolve, reject) => {
-        const timeout = setTimeout(() => {
-          reject(new Error('File recognition timeout'));
-          recognizer.close();
-        }, 30000); // 30 second timeout
-
-        recognizer.recognizeOnceAsync(
-          (result) => {
-            clearTimeout(timeout);
-            if (result.reason === sdk.ResultReason.RecognizedSpeech) {
-              resolve(result.text);
-            } else if (result.reason === sdk.ResultReason.NoMatch) {
-              resolve(''); // No speech detected in file
-            } else {
-              reject(new Error(`File recognition failed: ${result.reason}`));
-            }
-            recognizer.close();
-            audioConfig.close();
-          },
-          (error) => {
-            clearTimeout(timeout);
-            reject(new Error(`File recognition error: ${error}`));
-            recognizer.close();
-            audioConfig.close();
-          }
-        );
+      const audioBuffer = fs.readFileSync(audioFilePath);
+      const isWav = audioFilePath.toLowerCase().endsWith('.wav');
+      const language = config.get('speech.azure.language') || config.get('speech.volcengine.language') || 'en-US';
+      this.speechAdapter.setBackend(this.speechProvider);
+      const result = await this.speechAdapter.transcribe({
+        audioBuffer,
+        audioFormat: isWav ? 'wav' : 'pcm',
+        language
       });
+      const text = result.DisplayText || '';
 
       logger.logPerformance('File speech recognition', startTime, {
         filePath: audioFilePath,
-        textLength: result.length
+        backend: this.speechProvider,
+        textLength: text.length
       });
 
-      return result;
+      return text;
     } catch (error) {
       logger.error('File recognition failed', { 
         filePath: audioFilePath, 
@@ -820,6 +879,8 @@ class SpeechService extends EventEmitter {
     return {
       isRecording: this.isRecording,
       isInitialized: !!this.speechConfig,
+      backend: this.speechProvider,
+      role: this.currentRole,
       sessionDuration: this.sessionStartTime ? Date.now() - this.sessionStartTime : 0,
       retryCount: this.retryCount,
       config: config.get('speech.azure') || {}
@@ -879,15 +940,17 @@ class SpeechService extends EventEmitter {
        });
 
        // Pipe audio data to Azure Speech SDK
-       this.recording.stream().on('data', (chunk) => {
-         if (this.pushStream && this.isRecording) {
-           try {
-             this.pushStream.write(chunk);
-             // Console log only first few chunks to avoid spam
-             if (!this._audioDataLogged) {
-               this._audioDataLogged = true;
-             }
-           } catch (error) {
+        this.recording.stream().on('data', (chunk) => {
+          if (this.pushStream && this.isRecording) {
+            try {
+              this.pushStream.write(chunk);
+              const markedChunk = this.roleController.markAudioChunk(chunk);
+              this.emit('audio-chunk-marked', { role: markedChunk.role, timestamp: markedChunk.timestamp, size: chunk.length });
+              // Console log only first few chunks to avoid spam
+              if (!this._audioDataLogged) {
+                this._audioDataLogged = true;
+              }
+            } catch (error) {
            }
          }
        });
@@ -947,14 +1010,16 @@ class SpeechService extends EventEmitter {
            tryNextProgram();
          });
 
-         this.recording.stream().on('data', (chunk) => {
-           if (this.pushStream && this.isRecording) {
-             try {
-               this.pushStream.write(chunk);
-               if (!this._audioDataLogged) {
-                 this._audioDataLogged = true;
-               }
-             } catch (error) {
+          this.recording.stream().on('data', (chunk) => {
+            if (this.pushStream && this.isRecording) {
+              try {
+                this.pushStream.write(chunk);
+                const markedChunk = this.roleController.markAudioChunk(chunk);
+                this.emit('audio-chunk-marked', { role: markedChunk.role, timestamp: markedChunk.timestamp, size: chunk.length });
+                if (!this._audioDataLogged) {
+                  this._audioDataLogged = true;
+                }
+              } catch (error) {
               logger.error('Error writing audio data', { error: error.message });
              }
            }
@@ -972,6 +1037,18 @@ class SpeechService extends EventEmitter {
   // Expose availability to UI
   isAvailable() {
     return !!this.speechConfig && !!this.available;
+  }
+
+  handleRoleShortcutPress(source = 'shortcut') {
+    return this.roleController.handleShortcutPress(source);
+  }
+
+  handleRoleShortcutRelease(source = 'shortcut') {
+    return this.roleController.handleShortcutRelease(source);
+  }
+
+  getCurrentRole() {
+    return this.currentRole;
   }
 }
 

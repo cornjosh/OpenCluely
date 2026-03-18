@@ -1,0 +1,32 @@
+{
+  "llm": {
+    "provider": "gemini",
+    "gemini": {
+      "model": "gemini-2.5-flash"
+    },
+    "openai": {
+      "baseUrl": "https://api.openai.com/v1",
+      "model": "gpt-4o-mini"
+    }
+  },
+  "speech": {
+    "provider": "azure",
+    "azure": {
+      "language": "en-US"
+    },
+    "volcengine": {
+      "endpoint": "https://openspeech.bytedance.com/api/v1/vc/ata/submit",
+      "language": "en-US"
+    },
+    "roleSwitch": {
+      "defaultRole": "interviewer",
+      "alternateRole": "interviewee",
+      "shortcut": "CommandOrControl+B",
+      "persistPath": "~/.OpenCluely/speech/role-segments.json"
+    }
+  },
+  "logging": {
+    "level": "info",
+    "path": "~/.OpenCluely/logs"
+  }
+}

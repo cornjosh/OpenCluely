@@ -21,6 +21,7 @@ class ApplicationController {
   // Default to C++ so language is enforced from first run
   this.codingLanguage = "cpp";
     this.speechAvailable = false;
+    this.roleSwitchShortcut = config.get("speech.roleSwitch.shortcut") || "CommandOrControl+B";
 
     // Window configurations for reference
     this.windowConfigs = {
@@ -84,6 +85,7 @@ class ApplicationController {
 
       await windowManager.initializeWindows();
       this.setupGlobalShortcuts();
+      this.setupRoleSwitchListeners();
 
       // Initialize default stealth mode with terminal icon
       this.updateAppIcon("terminal");
@@ -162,10 +164,48 @@ class ApplicationController {
       "CommandOrControl+Right": () => this.handleRightArrow(),
     };
 
+    if (speechService.roleController?.detectShortcutConflict(Object.keys(shortcuts))) {
+      logger.warn("Role switch shortcut conflicts with existing shortcut", {
+        action: "shortcut_conflict",
+        role: speechService.getCurrentRole?.() || "interviewer",
+        shortcut: this.roleSwitchShortcut
+      });
+    }
+
     Object.entries(shortcuts).forEach(([accelerator, handler]) => {
       const success = globalShortcut.register(accelerator, handler);
       logger.debug("Global shortcut registered", { accelerator, success });
     });
+  }
+
+  setupRoleSwitchListeners() {
+    const shortcut = String(this.roleSwitchShortcut || "CommandOrControl+B").toLowerCase();
+    const targetKey = shortcut.split("+").pop();
+    const requiresMetaOrControl = shortcut.includes("commandorcontrol");
+
+    const bindWindowInputListeners = (window) => {
+      if (!window || !window.webContents) {
+        return;
+      }
+
+      window.webContents.on("before-input-event", (event, input) => {
+        const key = String(input.key || "").toLowerCase();
+        const matchesPrimaryModifier = requiresMetaOrControl ? (input.control || input.meta) : true;
+        const isMatch = key === targetKey && matchesPrimaryModifier;
+
+        if (!isMatch) {
+          return;
+        }
+
+        if (input.type === "keyDown" && !input.isAutoRepeat) {
+          speechService.handleRoleShortcutPress("electron");
+        } else if (input.type === "keyUp") {
+          speechService.handleRoleShortcutRelease("electron");
+        }
+      });
+    };
+
+    BrowserWindow.getAllWindows().forEach(bindWindowInputListeners);
   }
 
   setupServiceEventHandlers() {
@@ -203,6 +243,31 @@ class ApplicationController {
           });
         }
       }, 500);
+    });
+
+    speechService.on("transcription-with-role", ({ text, role }) => {
+      BrowserWindow.getAllWindows().forEach((window) => {
+        window.webContents.send("transcription-received-with-role", { text, role });
+      });
+    });
+
+    speechService.on("recording-role-changed", ({ role, action, timestamp }) => {
+      BrowserWindow.getAllWindows().forEach((window) => {
+        window.webContents.send("recording-role-changed", { role, action, timestamp });
+      });
+      logger.info("Recording role changed", {
+        action: action || "role_change",
+        role
+      });
+    });
+
+    speechService.on("audio-chunk-marked", ({ role, timestamp, size }) => {
+      logger.debug("Audio chunk role marker", {
+        action: "audio_chunk_mark",
+        role,
+        timestamp,
+        size
+      });
     });
 
     speechService.on("interim-transcription", (text) => {
@@ -1019,6 +1084,7 @@ class ApplicationController {
   }
 
   onWillQuit() {
+    speechService.roleController?.persistSegments?.();
     globalShortcut.unregisterAll();
     windowManager.destroyAllWindows();
 

@@ -2,10 +2,11 @@ const winston = require('winston');
 const DailyRotateFile = require('winston-daily-rotate-file');
 const path = require('path');
 const os = require('os');
+const config = require('./config');
 
 class Logger {
   constructor() {
-    this.logDir = path.join(os.homedir(), '.OpenCluely', 'logs');
+    this.logDir = config.get('logging.path') || path.join(os.homedir(), '.OpenCluely', 'logs');
     this.setupLogger();
   }
 
@@ -13,16 +14,19 @@ class Logger {
     const logFormat = winston.format.combine(
       winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss.SSS' }),
       winston.format.errors({ stack: true }),
-      winston.format.printf(({ timestamp, level, message, stack, service, ...meta }) => {
-        const metaStr = Object.keys(meta).length ? JSON.stringify(meta, null, 2) : '';
-        const serviceStr = service ? `[${service}]` : '';
+      winston.format.printf(({ timestamp, level, message, stack, service, role, action, details, ...meta }) => {
+        const moduleName = service || 'APP';
+        const roleName = role || 'n/a';
+        const actionName = action || 'log';
+        const detailPayload = details || meta;
+        const detailStr = Object.keys(detailPayload || {}).length ? JSON.stringify(detailPayload, null, 2) : '';
         const stackStr = stack ? `\n${stack}` : '';
-        return `${timestamp} ${level.toUpperCase()} ${serviceStr} ${message}${stackStr}${metaStr ? `\n${metaStr}` : ''}`;
+        return `${timestamp} | ${moduleName} | ${roleName} | ${actionName} | ${level.toUpperCase()} | ${message}${stackStr}${detailStr ? `\n${detailStr}` : ''}`;
       })
     );
 
     this.logger = winston.createLogger({
-      level: process.env.LOG_LEVEL || 'info',
+      level: config.get('logging.level') || process.env.LOG_LEVEL || 'info',
       format: logFormat,
       defaultMeta: { pid: process.pid },
       transports: [
