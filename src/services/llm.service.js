@@ -1,4 +1,3 @@
-const { GoogleGenerativeAI } = require('@google/generative-ai');
 const logger = require('../core/logger').createServiceLogger('LLM');
 const config = require('../core/config');
 const { promptLoader } = require('../../prompt-loader');
@@ -6,8 +5,7 @@ const { OpenAICompatibleChatClient } = require('./adapters/openai-compatible-cha
 
 class LLMService {
   constructor() {
-    this.client = null;
-    this.model = null;
+    this.provider = config.get('llm.provider') || 'gemini';
     this.isInitialized = false;
     this.requestCount = 0;
     this.errorCount = 0;
@@ -28,35 +26,27 @@ class LLMService {
   }
 
   initializeClient() {
-    const apiKey = config.getApiKey('GEMINI');
-    
-    if (!apiKey || apiKey === 'your-api-key-here') {
-      logger.warn('Gemini API key not configured', { 
-        keyExists: !!apiKey,
-        isPlaceholder: apiKey === 'your-api-key-here'
+    this.provider = config.get('llm.provider') || 'gemini';
+    const geminiKey = config.getApiKey('GEMINI');
+    const openAIKey = process.env.OPENAI_API_KEY;
+    const hasProviderKey = this.provider === 'openai'
+      ? !!openAIKey
+      : !!geminiKey;
+
+    if (!hasProviderKey) {
+      logger.warn('LLM provider key not configured', {
+        provider: this.provider,
+        geminiKeyExists: !!geminiKey,
+        openAIKeyExists: !!openAIKey
       });
       return;
     }
 
-    try {
-      this.client = new GoogleGenerativeAI(apiKey);
-      
-      // Use the correct model name for v1 API
-      const modelName = config.get('llm.gemini.model');
-      this.model = this.client.getGenerativeModel({ 
-        model: modelName,
-        generationConfig: this.getGenerationConfig()
-      });
-      this.isInitialized = true;
-      
-      logger.info('Gemini AI client initialized successfully', {
-        model: modelName
-      });
-    } catch (error) {
-      logger.error('Failed to initialize Gemini client', { 
-        error: error.message 
-      });
-    }
+    this.isInitialized = true;
+    logger.info('LLM client initialized with OpenAI-compatible adapter', {
+      provider: this.provider,
+      model: this.provider === 'openai' ? config.get('llm.openai.model') : config.get('llm.gemini.model')
+    });
   }
 
   getGenerationConfig(overrides = {}) {
@@ -759,15 +749,64 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
     return `Context: ${activeSkill.toUpperCase()} analysis request\n\nText to analyze:\n${text}`;
   }
 
+  buildOpenAIRequestFromGeminiRequest(geminiRequest = {}) {
+    const systemText = geminiRequest?.systemInstruction?.parts
+      ?.map((part) => part?.text)
+      .filter(Boolean)
+      .join('\n');
+
+    const messages = [];
+    if (systemText) {
+      messages.push({ role: 'system', content: systemText });
+    }
+
+    const contents = Array.isArray(geminiRequest.contents) ? geminiRequest.contents : [];
+    for (const item of contents) {
+      const role = item?.role === 'model' ? 'assistant' : 'user';
+      const parts = Array.isArray(item?.parts) ? item.parts : [];
+
+      const hasInlineData = parts.some((part) => part?.inlineData?.data);
+      if (!hasInlineData) {
+        const textContent = parts.map((part) => part?.text).filter(Boolean).join('\n').trim();
+        messages.push({ role, content: textContent });
+        continue;
+      }
+
+      const contentBlocks = [];
+      for (const part of parts) {
+        if (part?.text) {
+          contentBlocks.push({ type: 'text', text: part.text });
+        }
+        if (part?.inlineData?.data) {
+          const mimeType = part.inlineData.mimeType || 'image/png';
+          contentBlocks.push({
+            type: 'image_url',
+            image_url: {
+              url: `data:${mimeType};base64,${part.inlineData.data}`
+            }
+          });
+        }
+      }
+      messages.push({ role, content: contentBlocks });
+    }
+
+    return {
+      model: this.provider === 'openai' ? config.get('llm.openai.model') : config.get('llm.gemini.model'),
+      temperature: geminiRequest?.generationConfig?.temperature ?? config.get('llm.gemini.generation.temperature') ?? 0.7,
+      top_p: geminiRequest?.generationConfig?.topP,
+      max_tokens: geminiRequest?.generationConfig?.maxOutputTokens ?? config.get('llm.gemini.generation.maxOutputTokens') ?? 4096,
+      messages
+    };
+  }
+
   async executeRequest(geminiRequest) {
     const maxRetries = config.get('llm.gemini.maxRetries');
     const timeout = config.get('llm.gemini.timeout');
+    const openAIRequest = this.buildOpenAIRequestFromGeminiRequest(geminiRequest);
     
-    // Add request debugging
-    logger.debug('Executing Gemini request', {
-      hasModel: !!this.model,
-      hasClient: !!this.client,
-      requestKeys: Object.keys(geminiRequest),
+    logger.debug('Executing OpenAI-compatible request', {
+      provider: this.provider,
+      requestKeys: Object.keys(openAIRequest),
       timeout,
       maxRetries,
       nodeVersion: process.version,
@@ -783,28 +822,27 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
           setTimeout(() => reject(new Error('Request timeout')), timeout)
         );
         
-        logger.debug(`Gemini API attempt ${attempt} starting`, {
+        logger.debug(`OpenAI-compatible API attempt ${attempt} starting`, {
           timestamp: new Date().toISOString(),
           timeout
         });
         
-        const requestPromise = this.model.generateContent(geminiRequest);
+        const requestPromise = this.chatClient.createChatCompletion(openAIRequest);
         const result = await Promise.race([requestPromise, timeoutPromise]);
-        
-        if (!result.response) {
-          throw new Error('Empty response from Gemini API');
+        const text = result?.choices?.[0]?.message?.content || '';
+        const finishReason = result?.choices?.[0]?.finish_reason || null;
+        if (!text) {
+          throw new Error('Empty response from OpenAI-compatible client');
         }
 
-        const { text, finishReason } = this.extractTextFromCandidates(result.response);
-
         if (finishReason === 'MAX_TOKENS') {
-          logger.warn('Gemini primary response reached max tokens limit', {
+          logger.warn('OpenAI-compatible response reached max tokens limit', {
             attempt,
             finishReason
           });
         }
 
-        logger.debug('Gemini API request successful', {
+        logger.debug('OpenAI-compatible request successful', {
           attempt,
           responseLength: text.length,
           finishReason
@@ -829,7 +867,7 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
           });
         }
         
-        logger.warn(`Gemini API attempt ${attempt} failed`, {
+        logger.warn(`OpenAI-compatible API attempt ${attempt} failed`, {
           error: error.message,
           errorType: errorInfo.type,
           isNetworkError: errorInfo.isNetworkError,
@@ -838,7 +876,7 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
         });
 
         if (attempt === maxRetries) {
-          const finalError = new Error(`Gemini API failed after ${maxRetries} attempts: ${error.message}`);
+          const finalError = new Error(`LLM request failed after ${maxRetries} attempts: ${error.message}`);
           finalError.errorAnalysis = errorInfo;
           finalError.originalError = error;
           throw finalError;
@@ -1074,18 +1112,16 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
       }
 
       const testRequest = {
-        contents: [{
-          role: 'user',
-          parts: [{ text: 'Test connection. Please respond with "OK".' }]
-        }]
+        model: this.provider === 'openai' ? config.get('llm.openai.model') : config.get('llm.gemini.model'),
+        temperature: 0,
+        max_tokens: 10,
+        messages: [{ role: 'user', content: 'Test connection. Please respond with "OK".' }]
       };
 
-      this.applyGenerationDefaults(testRequest, { temperature: 0, maxOutputTokens: 10 });
-
       const startTime = Date.now();
-      const result = await this.model.generateContent(testRequest);
+      const result = await this.chatClient.createChatCompletion(testRequest);
       const latency = Date.now() - startTime;
-      const { text } = this.extractTextFromCandidates(result.response);
+      const text = result?.choices?.[0]?.message?.content || '';
       
       logger.info('Connection test successful', { 
         response: text, 
@@ -1129,7 +1165,8 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
       requestCount: this.requestCount,
       errorCount: this.errorCount,
       successRate: this.requestCount > 0 ? ((this.requestCount - this.errorCount) / this.requestCount) * 100 : 0,
-      config: config.get('llm.gemini')
+      provider: this.provider,
+      config: this.provider === 'openai' ? config.get('llm.openai') : config.get('llm.gemini')
     };
   }
 
@@ -1138,93 +1175,8 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
   }
 
   async executeAlternativeRequest(geminiRequest) {
-    const https = require('https');
-    const apiKey = config.getApiKey('GEMINI');
-    const model = config.get('llm.gemini.model');
-    
-    logger.info('Using alternative HTTPS request method');
-    
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
-    
-    const postData = JSON.stringify(geminiRequest);
-    
-    const agent = new https.Agent({ keepAlive: true, maxSockets: 1 });
-
-    const options = {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-goog-api-key': apiKey,
-        'Content-Length': Buffer.byteLength(postData),
-        'User-Agent': this.getUserAgent()
-      },
-      timeout: config.get('llm.gemini.timeout'),
-      agent
-    };
-
-    return new Promise((resolve, reject) => {
-      const req = https.request(url, options, (res) => {
-        let data = '';
-        
-        res.on('data', (chunk) => {
-          data += chunk;
-        });
-        
-        res.on('end', () => {
-          try {
-            if (res.statusCode !== 200) {
-              reject(new Error(`HTTP ${res.statusCode}: ${data}`));
-              return;
-            }
-            
-            const response = JSON.parse(data);
-            
-            logger.debug('Alternative request response structure', {
-              hasResponse: !!response,
-              hasCandidates: !!response.candidates,
-              candidatesLength: response.candidates?.length,
-              responseKeys: Object.keys(response || {}),
-              firstCandidateKeys: response.candidates?.[0] ? Object.keys(response.candidates[0]) : []
-            });
-
-            const { text, finishReason } = this.extractTextFromCandidates(response);
-
-            if (finishReason === 'MAX_TOKENS') {
-              logger.warn('Gemini alternative response reached max tokens limit', {
-                finishReason
-              });
-            }
-            
-            logger.info('Alternative request successful', {
-              responseLength: text.length,
-              statusCode: res.statusCode,
-              finishReason
-            });
-            
-            resolve(text.trim());
-          } catch (parseError) {
-            logger.error('Failed to parse alternative response', {
-              error: parseError.message,
-              rawResponse: data.substring(0, 500),
-              statusCode: res.statusCode
-            });
-            reject(new Error(`Failed to parse response: ${parseError.message}`));
-          }
-        });
-      });
-      
-      req.on('error', (error) => {
-        reject(new Error(`Alternative request failed: ${error.message}`));
-      });
-      
-      req.on('timeout', () => {
-        req.destroy();
-        reject(new Error('Alternative request timeout'));
-      });
-      
-      req.write(postData);
-      req.end();
-    });
+    logger.info('Alternative request path delegates to OpenAI-compatible client');
+    return this.executeRequest(geminiRequest);
   }
 }
 

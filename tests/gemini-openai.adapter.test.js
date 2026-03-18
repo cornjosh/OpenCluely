@@ -36,4 +36,23 @@ describe('GeminiOpenAIAdapter', () => {
     expect(response.choices[0].message.content).toBe('Hi');
     expect(response.usage.total_tokens).toBe(7);
   });
+
+  test('maps OpenAI image content blocks to Gemini inlineData parts', () => {
+    const adapter = new GeminiOpenAIAdapter({ apiKey: 'test-key', fetchImpl: jest.fn() });
+    const { request } = adapter.mapOpenAIToGeminiRequest({
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'analyze image' },
+            { type: 'image_url', image_url: { url: 'data:image/png;base64,Zm9vYmFy' } }
+          ]
+        }
+      ]
+    });
+
+    expect(request.contents[0].parts[0].text).toBe('analyze image');
+    expect(request.contents[0].parts[1].inlineData.mimeType).toBe('image/png');
+    expect(request.contents[0].parts[1].inlineData.data).toBe('Zm9vYmFy');
+  });
 });

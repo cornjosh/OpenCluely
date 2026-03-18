@@ -40,7 +40,7 @@ class GeminiOpenAIAdapter {
 
     const contents = chatMessages.map((message) => ({
       role: message.role === 'assistant' ? 'model' : 'user',
-      parts: [{ text: typeof message.content === 'string' ? message.content : '' }]
+      parts: this.mapMessageContentToGeminiParts(message.content)
     }));
 
     const request = {
@@ -67,6 +67,39 @@ class GeminiOpenAIAdapter {
       request,
       stream: !!stream
     };
+  }
+
+  mapMessageContentToGeminiParts(content) {
+    if (typeof content === 'string') {
+      return [{ text: content }];
+    }
+
+    if (!Array.isArray(content)) {
+      return [{ text: '' }];
+    }
+
+    const parts = [];
+    for (const block of content) {
+      if (block?.type === 'text' && typeof block.text === 'string') {
+        parts.push({ text: block.text });
+      }
+
+      if (block?.type === 'image_url' && typeof block?.image_url?.url === 'string') {
+        const match = block.image_url.url.match(/^data:(.+?);base64,(.+)$/);
+        if (!match) {
+          continue;
+        }
+        const [, mimeType, data] = match;
+        parts.push({
+          inlineData: {
+            mimeType,
+            data
+          }
+        });
+      }
+    }
+
+    return parts.length ? parts : [{ text: '' }];
   }
 
   mapGeminiToOpenAIResponse(openAIRequest, geminiJson) {
