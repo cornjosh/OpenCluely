@@ -11,7 +11,6 @@ async function run() {
     if (result.success) {
       console.log('Azure speech connectivity test passed.');
       process.exit(0);
-      return;
     }
 
     console.error(`Azure speech connectivity test failed: ${result.message}`);
